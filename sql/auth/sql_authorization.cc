@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -228,7 +228,6 @@ bool Sql_cmd_update::multi_update_precheck(THD *thd, TABLE_LIST *tables)
 
 bool multi_delete_precheck(THD *thd, TABLE_LIST *tables)
 {
-  SELECT_LEX *select_lex= thd->lex->select_lex;
   TABLE_LIST *aux_tables= thd->lex->auxiliary_table_list.first;
   TABLE_LIST **save_query_tables_own_last= thd->lex->query_tables_own_last;
   DBUG_ENTER("multi_delete_precheck");
@@ -251,13 +250,6 @@ bool multi_delete_precheck(THD *thd, TABLE_LIST *tables)
   }
   thd->lex->query_tables_own_last= save_query_tables_own_last;
 
-  if ((thd->variables.option_bits & OPTION_SAFE_UPDATES) &&
-      !select_lex->where_cond())
-  {
-    my_message(ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE,
-               ER(ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE), MYF(0));
-    DBUG_RETURN(TRUE);
-  }
   DBUG_RETURN(FALSE);
 }
 
@@ -3649,20 +3641,12 @@ bool sp_grant_privileges(THD *thd, const char *sp_db, const char *sp_name,
   if (!(combo=(LEX_USER*) thd->alloc(sizeof(st_lex_user))))
     DBUG_RETURN(TRUE);
 
-  combo->user.str= (char *) sctx->user().str;
+  combo->user.str= (char *) sctx->priv_user().str;
 
   mysql_mutex_lock(&acl_cache->lock);
 
-  if ((au= find_acl_user(combo->host.str= (char *) sctx->host_or_ip().str,
+  if ((au= find_acl_user(combo->host.str= (char *) sctx->priv_host().str,
                          combo->user.str, false)))
-    goto found_acl;
-  if ((au= find_acl_user(combo->host.str= (char *) sctx->host().str,
-                         combo->user.str, false)))
-    goto found_acl;
-  if ((au= find_acl_user(combo->host.str= (char*) sctx->ip().str,
-                         combo->user.str, false)))
-    goto found_acl;
-  if((au= find_acl_user(combo->host.str=(char*)"%", combo->user.str, FALSE)))
     goto found_acl;
 
   mysql_mutex_unlock(&acl_cache->lock);

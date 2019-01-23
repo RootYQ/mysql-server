@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2013, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -798,8 +798,13 @@ bool Sql_cmd_xa_prepare::trans_xa_prepare(THD *thd)
     my_error(ER_XAER_RMFAIL, MYF(0), xid_state->state_name());
   else if (!xid_state->has_same_xid(m_xid))
     my_error(ER_XAER_NOTA, MYF(0));
-  else
-  {
+  else if (thd->slave_thread &&
+           is_transaction_empty(
+               thd)) // No changes in none of the storage engine
+                     // means, filtered statements in the slave
+    my_error(ER_XA_REPLICATION_FILTERS,
+             MYF(0)); // Empty XA transactions not allowed
+  else {
     /*
       Acquire metadata lock which will ensure that XA PREPARE is blocked
       by active FLUSH TABLES WITH READ LOCK (and vice versa PREPARE in
@@ -1295,6 +1300,15 @@ static void attach_native_trx(THD *thd)
       ha_info->reset();
     }
   }
+  else
+  {
+    /*
+      Although the current `Ha_trx_info` object is null, we need to make sure
+      that the data engine plugins have the oportunity to attach their internal
+      transactions and clean up the session.
+     */
+    thd->rpl_reattach_engine_ha_data();
+  }
 }
 
 
@@ -1382,4 +1396,20 @@ my_bool detach_native_trx(THD *thd, plugin_ref plugin, void *unused)
   }
 
   return FALSE;
+}
+
+my_bool reattach_native_trx(THD *thd, plugin_ref plugin, void *)
+{
+  DBUG_ENTER("reattach_native_trx");
+  handlerton *hton = plugin_data<handlerton *>(plugin);
+
+  if (hton->replace_native_transaction_in_thd)
+  {
+    /* restore the saved original engine transaction's link with thd */
+    void **trx_backup = &thd->ha_data[hton->slot].ha_ptr_backup;
+
+    hton->replace_native_transaction_in_thd(thd, *trx_backup, NULL);
+    *trx_backup = NULL;
+  }
+  DBUG_RETURN(FALSE);
 }

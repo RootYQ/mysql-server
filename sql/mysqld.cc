@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -256,6 +256,7 @@ static PSI_thread_key key_thread_handle_con_sockets;
 static PSI_mutex_key key_LOCK_handler_count;
 static PSI_cond_key key_COND_handler_count;
 static PSI_thread_key key_thread_handle_shutdown;
+static PSI_rwlock_key key_rwlock_LOCK_named_pipe_full_access_group;
 #else
 static PSI_mutex_key key_LOCK_socket_listener_active;
 static PSI_cond_key key_COND_socket_listener_active;
@@ -473,7 +474,7 @@ ulonglong  max_binlog_cache_size=0;
 ulong slave_max_allowed_packet= 0;
 ulong binlog_stmt_cache_size=0;
 int32 opt_binlog_max_flush_queue_time= 0;
-ulong opt_binlog_group_commit_sync_delay= 0;
+long opt_binlog_group_commit_sync_delay= 0;
 ulong opt_binlog_group_commit_sync_no_delay_count= 0;
 ulonglong  max_binlog_stmt_cache_size=0;
 ulong query_cache_size=0;
@@ -672,6 +673,7 @@ mysql_mutex_t LOCK_prepared_stmt_count;
 */
 mysql_mutex_t LOCK_sql_slave_skip_counter;
 mysql_mutex_t LOCK_slave_net_timeout;
+mysql_mutex_t LOCK_slave_trans_dep_tracker;
 mysql_mutex_t LOCK_log_throttle_qni;
 mysql_mutex_t LOCK_offline_mode;
 #ifdef HAVE_OPENSSL
@@ -686,7 +688,6 @@ mysql_cond_t COND_server_started;
 mysql_mutex_t LOCK_reset_gtid_table;
 mysql_mutex_t LOCK_compress_gtid_table;
 mysql_cond_t COND_compress_gtid_table;
-mysql_mutex_t LOCK_group_replication_handler;
 #if !defined (EMBEDDED_LIBRARY) && !defined(_WIN32)
 mysql_mutex_t LOCK_socket_listener_active;
 mysql_cond_t COND_socket_listener_active;
@@ -751,8 +752,11 @@ int show_rsa_public_key(THD *thd, SHOW_VAR *var, char *buff);
 
 Connection_acceptor<Mysqld_socket_listener> *mysqld_socket_acceptor= NULL;
 #ifdef _WIN32
+static Named_pipe_listener *named_pipe_listener= NULL;
 Connection_acceptor<Named_pipe_listener> *named_pipe_acceptor= NULL;
 Connection_acceptor<Shared_mem_listener> *shared_mem_acceptor= NULL;
+mysql_rwlock_t LOCK_named_pipe_full_access_group;
+char *named_pipe_full_access_group;
 #endif
 
 Checkable_rwlock *global_sid_lock= NULL;
@@ -1434,6 +1438,7 @@ static void clean_up_mutexes()
   mysql_mutex_destroy(&LOCK_prepared_stmt_count);
   mysql_mutex_destroy(&LOCK_sql_slave_skip_counter);
   mysql_mutex_destroy(&LOCK_slave_net_timeout);
+  mysql_mutex_destroy(&LOCK_slave_trans_dep_tracker);
   mysql_mutex_destroy(&LOCK_error_messages);
   mysql_mutex_destroy(&LOCK_offline_mode);
   mysql_mutex_destroy(&LOCK_default_password_lifetime);
@@ -1441,6 +1446,7 @@ static void clean_up_mutexes()
 #ifdef _WIN32
   mysql_cond_destroy(&COND_handler_count);
   mysql_mutex_destroy(&LOCK_handler_count);
+  mysql_rwlock_destroy(&LOCK_named_pipe_full_access_group);
 #endif
 #ifndef _WIN32
   mysql_cond_destroy(&COND_socket_listener_active);
@@ -1663,8 +1669,7 @@ static bool network_init(void)
   {
     std::string pipe_name= mysqld_unix_port ? mysqld_unix_port : "";
 
-    Named_pipe_listener *named_pipe_listener=
-      new (std::nothrow) Named_pipe_listener(&pipe_name);
+    named_pipe_listener= new (std::nothrow) Named_pipe_listener(&pipe_name);
     if (named_pipe_listener == NULL)
       return true;
 
@@ -2735,7 +2740,7 @@ int init_common_variables()
   /* TODO: remove this when my_time_t is 64 bit compatible */
   if (!IS_TIME_T_VALID_FOR_TIMESTAMP(server_start_time))
   {
-    sql_print_error("This MySQL server doesn't support dates later then 2038");
+    sql_print_error("This MySQL server doesn't support dates later than 2038");
     return 1;
   }
 
@@ -3080,6 +3085,16 @@ int init_common_variables()
     return 1;
   }
 
+  if (global_system_variables.transaction_write_set_extraction == HASH_ALGORITHM_OFF
+      && mysql_bin_log.m_dependency_tracker.m_opt_tracking_mode != DEPENDENCY_TRACKING_COMMIT_ORDER)
+  {
+    sql_print_error("The transaction_write_set_extraction must be set to XXHASH64 or MURMUR32"
+                    " when binlog_transaction_dependency_tracking is WRITESET or WRITESET_SESSION.");
+    return 1;
+  }
+  else
+    mysql_bin_log.m_dependency_tracker.tracking_mode_changed();
+
 #define FIX_LOG_VAR(VAR, ALT)                                   \
   if (!VAR || !*VAR)                                            \
     VAR= ALT;
@@ -3197,6 +3212,8 @@ static int init_thread_environment()
                    &LOCK_sql_slave_skip_counter, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_slave_net_timeout,
                    &LOCK_slave_net_timeout, MY_MUTEX_INIT_FAST);
+  mysql_mutex_init(key_LOCK_slave_trans_dep_tracker,
+                   &LOCK_slave_trans_dep_tracker, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_error_messages,
                    &LOCK_error_messages, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_uuid_generator,
@@ -3227,14 +3244,14 @@ static int init_thread_environment()
                    &LOCK_compress_gtid_table, MY_MUTEX_INIT_FAST);
   mysql_cond_init(key_COND_compress_gtid_table,
                   &COND_compress_gtid_table);
-  mysql_mutex_init(key_LOCK_group_replication_handler,
-                   &LOCK_group_replication_handler, MY_MUTEX_INIT_FAST);
 #ifndef EMBEDDED_LIBRARY
   Events::init_mutexes();
 #if defined(_WIN32)
   mysql_mutex_init(key_LOCK_handler_count,
                    &LOCK_handler_count, MY_MUTEX_INIT_FAST);
   mysql_cond_init(key_COND_handler_count, &COND_handler_count);
+  mysql_rwlock_init(key_rwlock_LOCK_named_pipe_full_access_group,
+                    &LOCK_named_pipe_full_access_group);
 #else
   mysql_mutex_init(key_LOCK_socket_listener_active,
                    &LOCK_socket_listener_active, MY_MUTEX_INIT_FAST);
@@ -3398,7 +3415,11 @@ static int init_ssl()
 {
 #ifdef HAVE_OPENSSL
 #ifndef HAVE_YASSL
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   CRYPTO_malloc_init();
+#else /* OPENSSL_VERSION_NUMBER < 0x10100000L */
+  OPENSSL_malloc_init();
+#endif /* OPENSSL_VERSION_NUMBER < 0x10100000L */
 #endif
   ssl_start();
 #ifndef EMBEDDED_LIBRARY
@@ -3424,7 +3445,9 @@ static int init_ssl()
 					  opt_ssl_cipher, &error,
                                           opt_ssl_crl, opt_ssl_crlpath, ssl_ctx_flags);
     DBUG_PRINT("info",("ssl_acceptor_fd: 0x%lx", (long) ssl_acceptor_fd));
-    ERR_remove_state(0);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    ERR_remove_thread_state(0);
+#endif /* OPENSSL_VERSION_NUMBER < 0x10100000L */
     if (!ssl_acceptor_fd)
     {
       /*
@@ -3555,7 +3578,8 @@ static int generate_server_uuid()
 
   strncpy(server_uuid, uuid.c_ptr(), UUID_LENGTH);
   DBUG_EXECUTE_IF("server_uuid_deterministic",
-                  strncpy(server_uuid, "00000000-1111-0000-1111-000000000000", UUID_LENGTH););
+                  memcpy(server_uuid, "00000000-1111-0000-1111-000000000000",
+                         UUID_LENGTH););
   server_uuid[UUID_LENGTH]= '\0';
   return 0;
 }
@@ -3835,8 +3859,9 @@ static int init_server_components()
     */
     log_error_dest= errorlog_filename_buff;
 
-    if (open_error_log(errorlog_filename_buff))
+    if (open_error_log(errorlog_filename_buff, false))
       unireg_abort(MYSQLD_ABORT_EXIT);
+
 #ifdef _WIN32
     FreeConsole();        // Remove window
 #endif
@@ -4952,6 +4977,8 @@ int mysqld_main(int argc, char **argv)
       grant_init(opt_noacl))
   {
     abort_loop= true;
+    sql_print_error("Fatal error: Failed to initialize ACL/grant/time zones "
+                    "structures or failed to remove temporary table files.");
 
     delete_pid_file(MYF(MY_WME));
 
@@ -6555,10 +6582,11 @@ static int show_ssl_ctx_get_session_cache_mode(THD *thd, SHOW_VAR *var, char *bu
  */
 static int show_ssl_get_version(THD *thd, SHOW_VAR *var, char *buff)
 {
+  SSL_handle ssl = thd->get_ssl();
   var->type= SHOW_CHAR;
-  if (thd->get_protocol()->get_ssl())
+  if (ssl)
     var->value=
-      const_cast<char*>(SSL_get_version(thd->get_protocol()->get_ssl()));
+      const_cast<char*>(SSL_get_version(ssl));
   else
     var->value= (char *)"";
   return 0;
@@ -6566,11 +6594,12 @@ static int show_ssl_get_version(THD *thd, SHOW_VAR *var, char *buff)
 
 static int show_ssl_session_reused(THD *thd, SHOW_VAR *var, char *buff)
 {
+  SSL_handle ssl = thd->get_ssl();
   var->type= SHOW_LONG;
   var->value= buff;
-  if (thd->get_protocol()->get_ssl())
+  if (ssl)
     *((long *)buff)=
-        (long)SSL_session_reused(thd->get_protocol()->get_ssl());
+        (long)SSL_session_reused(ssl);
   else
     *((long *)buff)= 0;
   return 0;
@@ -6578,11 +6607,12 @@ static int show_ssl_session_reused(THD *thd, SHOW_VAR *var, char *buff)
 
 static int show_ssl_get_default_timeout(THD *thd, SHOW_VAR *var, char *buff)
 {
+  SSL_handle ssl = thd->get_ssl();
   var->type= SHOW_LONG;
   var->value= buff;
-  if (thd->get_protocol()->get_ssl())
+  if (ssl)
     *((long *)buff)=
-      (long)SSL_get_default_timeout(thd->get_protocol()->get_ssl());
+      (long)SSL_get_default_timeout(ssl);
   else
     *((long *)buff)= 0;
   return 0;
@@ -6590,11 +6620,12 @@ static int show_ssl_get_default_timeout(THD *thd, SHOW_VAR *var, char *buff)
 
 static int show_ssl_get_verify_mode(THD *thd, SHOW_VAR *var, char *buff)
 {
+  SSL_handle ssl = thd->get_ssl();
   var->type= SHOW_LONG;
   var->value= buff;
-  if (thd->get_protocol()->get_ssl())
+  if (ssl)
     *((long *)buff)=
-      (long)SSL_get_verify_mode(thd->get_protocol()->get_ssl());
+      (long)SSL_get_verify_mode(ssl);
   else
     *((long *)buff)= 0;
   return 0;
@@ -6602,11 +6633,12 @@ static int show_ssl_get_verify_mode(THD *thd, SHOW_VAR *var, char *buff)
 
 static int show_ssl_get_verify_depth(THD *thd, SHOW_VAR *var, char *buff)
 {
+  SSL_handle ssl = thd->get_ssl();
   var->type= SHOW_LONG;
   var->value= buff;
-  if (thd->get_protocol()->get_ssl())
+  if (ssl)
     *((long *)buff)=
-        (long)SSL_get_verify_depth(thd->get_protocol()->get_ssl());
+        (long)SSL_get_verify_depth(ssl);
   else
     *((long *)buff)= 0;
   return 0;
@@ -6614,10 +6646,11 @@ static int show_ssl_get_verify_depth(THD *thd, SHOW_VAR *var, char *buff)
 
 static int show_ssl_get_cipher(THD *thd, SHOW_VAR *var, char *buff)
 {
+  SSL_handle ssl = thd->get_ssl();
   var->type= SHOW_CHAR;
-  if (thd->get_protocol()->get_ssl())
+  if (ssl)
     var->value=
-      const_cast<char*>(SSL_get_cipher(thd->get_protocol()->get_ssl()));
+      const_cast<char*>(SSL_get_cipher(ssl));
   else
     var->value= (char *)"";
   return 0;
@@ -6625,14 +6658,15 @@ static int show_ssl_get_cipher(THD *thd, SHOW_VAR *var, char *buff)
 
 static int show_ssl_get_cipher_list(THD *thd, SHOW_VAR *var, char *buff)
 {
+  SSL_handle ssl = thd->get_ssl();
   var->type= SHOW_CHAR;
   var->value= buff;
-  if (thd->get_protocol()->get_ssl())
+  if (ssl)
   {
     int i;
     const char *p;
     char *end= buff + SHOW_VAR_FUNC_BUFF_SIZE;
-    for (i=0; (p= SSL_get_cipher_list(thd->get_protocol()->get_ssl(),i)) &&
+    for (i=0; (p= SSL_get_cipher_list(ssl,i)) &&
                buff < end; i++)
     {
       buff= my_stpnmov(buff, p, end-buff-1);
@@ -7702,6 +7736,15 @@ pfs_error:
     global_system_variables.transaction_isolation=
                             global_system_variables.tx_isolation;
     break;
+  case OPT_NAMED_PIPE_FULL_ACCESS_GROUP:
+#if defined(_WIN32)  && !defined(EMBEDDED_LIBRARY)
+    if (!is_valid_named_pipe_full_access_group(argument))
+    {
+      sql_print_error("Invalid value for named_pipe_full_access_group.");
+      return 1;
+    }
+#endif /* _WIN32 && !EMBEDDED_LIBRARY */
+    break;
   }
   return 0;
 }
@@ -8448,6 +8491,41 @@ static int test_if_case_insensitive(const char *dir_name)
 static void create_pid_file()
 {
   File file;
+  bool check_parent_path= 1, is_path_accessible= 1;
+  char pid_filepath[FN_REFLEN], *pos= NULL;
+  /* Copy pid file name to get pid file path */
+  strcpy(pid_filepath, pidfile_name);
+
+  /* Iterate through the entire path to check if even one of the sub-dirs
+     is world-writable */
+  while (check_parent_path && (pos= strrchr(pid_filepath, FN_LIBCHAR))
+         && (pos != pid_filepath)) /* shouldn't check root */
+  {
+    *pos= '\0';  /* Trim the inner-most dir */
+    switch (is_file_or_dir_world_writable(pid_filepath))
+    {
+      case -2:
+        is_path_accessible= 0;
+        break;
+      case -1:
+        sql_print_error("Can't start server: can't check PID filepath: %s",
+                        strerror(errno));
+        exit(MYSQLD_ABORT_EXIT);
+      case 1:
+        sql_print_warning("Insecure configuration for --pid-file: Location "
+                          "'%s' in the path is accessible to all OS users. "
+                          "Consider choosing a different directory.",
+                          pid_filepath);
+        check_parent_path= 0;
+        break;
+      case 0:
+        continue; /* Keep checking the parent dir */
+    }
+  }
+  if (!is_path_accessible)
+  {
+    sql_print_warning("Few location(s) are inaccessible while checking PID filepath.");
+  }
   if ((file= mysql_file_create(key_file_pid, pidfile_name, 0664,
                                O_WRONLY | O_TRUNC, MYF(MY_WME))) >= 0)
   {
@@ -8616,6 +8694,7 @@ PSI_mutex_key
   key_LOCK_server_started, key_LOCK_status,
   key_LOCK_sql_slave_skip_counter,
   key_LOCK_slave_net_timeout,
+  key_LOCK_slave_trans_dep_tracker,
   key_LOCK_system_variables_hash, key_LOCK_table_share, key_LOCK_thd_data,
   key_LOCK_thd_sysvar,
   key_LOCK_user_conn, key_LOCK_uuid_generator, key_LOG_LOCK_log,
@@ -8650,7 +8729,6 @@ PSI_mutex_key key_mts_gaq_LOCK;
 PSI_mutex_key key_thd_timer_mutex;
 PSI_mutex_key key_LOCK_offline_mode;
 PSI_mutex_key key_LOCK_default_password_lifetime;
-PSI_mutex_key key_LOCK_group_replication_handler;
 
 #ifdef HAVE_REPLICATION
 PSI_mutex_key key_commit_order_manager_mutex;
@@ -8697,6 +8775,7 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_LOCK_prepared_stmt_count, "LOCK_prepared_stmt_count", PSI_FLAG_GLOBAL},
   { &key_LOCK_sql_slave_skip_counter, "LOCK_sql_slave_skip_counter", PSI_FLAG_GLOBAL},
   { &key_LOCK_slave_net_timeout, "LOCK_slave_net_timeout", PSI_FLAG_GLOBAL},
+  { &key_LOCK_slave_trans_dep_tracker, "LOCK_slave_trans_dep_tracker", PSI_FLAG_GLOBAL},
   { &key_LOCK_server_started, "LOCK_server_started", PSI_FLAG_GLOBAL},
   { &key_LOCK_keyring_operations, "LOCK_keyring_operations", PSI_FLAG_GLOBAL},
 #if !defined(EMBEDDED_LIBRARY) && !defined(_WIN32)
@@ -8734,7 +8813,7 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_gtid_ensure_index_mutex, "Gtid_state", PSI_FLAG_GLOBAL},
   { &key_LOCK_query_plan, "THD::LOCK_query_plan", PSI_FLAG_VOLATILITY_SESSION},
   { &key_LOCK_cost_const, "Cost_constant_cache::LOCK_cost_const",
-    PSI_FLAG_GLOBAL},  
+    PSI_FLAG_GLOBAL},
   { &key_LOCK_current_cond, "THD::LOCK_current_cond", PSI_FLAG_VOLATILITY_SESSION},
   { &key_mts_temp_table_LOCK, "key_mts_temp_table_LOCK", 0},
   { &key_LOCK_reset_gtid_table, "LOCK_reset_gtid_table", PSI_FLAG_GLOBAL},
@@ -8746,8 +8825,7 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_mutex_slave_worker_hash, "Relay_log_info::slave_worker_hash_lock", 0},
 #endif
   { &key_LOCK_offline_mode, "LOCK_offline_mode", PSI_FLAG_GLOBAL},
-  { &key_LOCK_default_password_lifetime, "LOCK_default_password_lifetime", PSI_FLAG_GLOBAL},
-  { &key_LOCK_group_replication_handler, "LOCK_group_replication_handler", PSI_FLAG_GLOBAL}
+  { &key_LOCK_default_password_lifetime, "LOCK_default_password_lifetime", PSI_FLAG_GLOBAL}
 };
 
 PSI_rwlock_key key_rwlock_LOCK_grant, key_rwlock_LOCK_logger,
@@ -8782,7 +8860,10 @@ static PSI_rwlock_info all_server_rwlocks[]=
   { &key_rwlock_channel_lock, "channel_lock", 0},
   { &key_rwlock_Trans_delegate_lock, "Trans_delegate::lock", PSI_FLAG_GLOBAL},
   { &key_rwlock_Server_state_delegate_lock, "Server_state_delegate::lock", PSI_FLAG_GLOBAL},
-  { &key_rwlock_Binlog_storage_delegate_lock, "Binlog_storage_delegate::lock", PSI_FLAG_GLOBAL}
+  { &key_rwlock_Binlog_storage_delegate_lock, "Binlog_storage_delegate::lock", PSI_FLAG_GLOBAL},
+#if defined(_WIN32) && !defined(EMBEDDED_LIBRARY)
+  { &key_rwlock_LOCK_named_pipe_full_access_group, "LOCK_named_pipe_full_access_group", PSI_FLAG_GLOBAL},
+#endif /* _WIN32 && !EMBEDDED_LIBRARY */
 };
 
 PSI_cond_key key_PAGE_cond, key_COND_active, key_COND_pool;
@@ -9532,4 +9613,18 @@ void init_server_psi_keys(void)
 }
 
 #endif /* HAVE_PSI_INTERFACE */
+
+#if defined(_WIN32) && !defined(EMBEDDED_LIBRARY)
+// update_named_pipe_full_access_group returns false on success, true on failure
+bool update_named_pipe_full_access_group(const char *new_group_name)
+{
+  if (named_pipe_acceptor) {
+    return named_pipe_listener->update_named_pipe_full_access_group(
+      new_group_name);
+  }
+  return true;
+}
+
+#endif  /* _WIN32 && !EMBEDDED_LIBRARY */
+
 

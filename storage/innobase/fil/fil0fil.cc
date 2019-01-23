@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -603,6 +603,8 @@ fil_node_create_low(
 	node->is_raw_disk = is_raw;
 
 	node->size = size;
+
+	node->flush_size = size;
 
 	node->magic_n = FIL_NODE_MAGIC_N;
 
@@ -2997,6 +2999,7 @@ fil_reinit_space_header_for_table(
 	they won't violate the latch ordering. */
 	dict_table_x_unlock_indexes(table);
 	row_mysql_unlock_data_dictionary(trx);
+	DEBUG_SYNC_C("trunc_table_index_dropped_release_dict_lock");
 
 	/* Lock the search latch in shared mode to prevent user
 	from disabling AHI during the scan */
@@ -5070,24 +5073,40 @@ retry:
 
 #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
 		int     ret = posix_fallocate(node->handle.m_file, node_start, len);
-		/* We already pass the valid offset and len in, if EINVAL
-		is returned, it could only mean that the file system doesn't
-		support fallocate(), currently one known case is
-		ext3 FS with O_DIRECT. We ignore EINVAL here so that the
-		error message won't flood. */
-		if (ret != 0 && ret != EINVAL) {
-			ib::error()
-				<< "posix_fallocate(): Failed to preallocate"
-				" data for file "
-				<< node->name << ", desired size "
-				<< len << " bytes."
-				" Operating system error number "
-				<< ret << ". Check"
-				" that the disk is not full or a disk quota"
-				" exceeded. Make sure the file system supports"
-				" this function. Some operating system error"
-				" numbers are described at " REFMAN
-				" operating-system-error-codes.html";
+
+		DBUG_EXECUTE_IF("ib_posix_fallocate_fail_eintr",
+				ret = EINTR;);
+
+		DBUG_EXECUTE_IF("ib_posix_fallocate_fail_einval",
+				ret = EINVAL;);
+
+		if (ret != 0) {
+			/* We already pass the valid offset and len in,
+			if EINVAL is returned, it could only mean that the
+			file system doesn't support fallocate(), currently
+			one known case is ext3 with O_DIRECT.
+
+			Also because above call could be interrupted,
+			in this case, simply go to plan B by writing zeroes.
+
+			Both error messages for above two scenarios are
+			skipped in case of flooding error messages, because
+			they can be ignored by users. */
+			if (ret != EINTR && ret != EINVAL) {
+				ib::error()
+					<< "posix_fallocate(): Failed to"
+					" preallocate data for file "
+					<< node->name << ", desired size "
+					<< len << " bytes."
+					" Operating system error number "
+					<< ret << ". Check"
+					" that the disk is not full or a disk"
+					" quota exceeded. Make sure the file"
+					" system supports this function."
+					" Some operating system error"
+					" numbers are described at " REFMAN
+					"operating-system-error-codes.html";
+			}
 
 			err = DB_IO_ERROR;
 		}
@@ -5904,26 +5923,37 @@ fil_flush(
 		return;
 	}
 
-	if (fil_buffering_disabled(space)) {
+	bool fbd = fil_buffering_disabled(space);
+	if (fbd) {
 
 		/* No need to flush. User has explicitly disabled
-		buffering. */
+		buffering. However, flush should be called if the file
+                size changes to keep OS metadata in sync. */
 		ut_ad(!space->is_in_unflushed_spaces);
 		ut_ad(fil_space_is_flushed(space));
 		ut_ad(space->n_pending_flushes == 0);
 
-#ifdef UNIV_DEBUG
+		/* Flush only if the file size changes */
+		bool no_flush = true;
 		for (node = UT_LIST_GET_FIRST(space->chain);
 		     node != NULL;
 		     node = UT_LIST_GET_NEXT(chain, node)) {
+#ifdef UNIV_DEBUG
 			ut_ad(node->modification_counter
 			      == node->flush_counter);
 			ut_ad(node->n_pending_flushes == 0);
-		}
 #endif /* UNIV_DEBUG */
+			if (node->flush_size != node->size) {
+				/* Found at least one file whose size has changed */
+				no_flush = false;
+				break;
+			}
+		}
 
-		mutex_exit(&fil_system->mutex);
-		return;
+		if (no_flush) {
+			mutex_exit(&fil_system->mutex);
+			return;
+		}
 	}
 
 	space->n_pending_flushes++;	/*!< prevent dropping of the space while
@@ -5934,11 +5964,26 @@ fil_flush(
 
 		int64_t	old_mod_counter = node->modification_counter;
 
-		if (old_mod_counter <= node->flush_counter) {
+		if (!node->is_open) {
 			continue;
 		}
 
-		ut_a(node->is_open);
+		/* Skip flushing if the file size has not changed since
+		last flush was done and the flush mode is O_DIRECT_NO_FSYNC */
+		if (fbd && (node->flush_size == node->size)) {
+			continue;
+		}
+
+		/* If we are here and the flush mode is O_DIRECT_NO_FSYNC, then
+		it means that the file size has changed and hence, it shold be
+		flushed, irrespective of the mod_counter and flush counter values,
+		which are always same in case of O_DIRECT_NO_FSYNC to avoid flush
+		on every write operation.
+		For other flush modes, if the flush_counter is same or ahead of
+		the mode_counter, skip the flush. */
+		if (!fbd && (old_mod_counter <= node->flush_counter)) {
+			continue;
+		}
 
 		switch (space->purpose) {
 		case FIL_TYPE_TEMPORARY:
@@ -5990,6 +6035,8 @@ retry:
 		mutex_exit(&fil_system->mutex);
 
 		os_file_flush(file);
+
+		node->flush_size = node->size;
 
 		mutex_enter(&fil_system->mutex);
 

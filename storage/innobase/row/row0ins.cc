@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -346,7 +346,7 @@ row_ins_clust_index_entry_by_modify(
 {
 	const rec_t*	rec;
 	upd_t*		update;
-	dberr_t		err;
+	dberr_t		err = DB_SUCCESS;
 	btr_cur_t*	cursor	= btr_pcur_get_btr_cur(pcur);
 	TABLE*		mysql_table = NULL;
 	ut_ad(dict_index_is_clust(cursor->index));
@@ -366,7 +366,11 @@ row_ins_clust_index_entry_by_modify(
 
 	update = row_upd_build_difference_binary(
 		cursor->index, entry, rec, NULL, true,
-		thr_get_trx(thr), heap, mysql_table);
+		thr_get_trx(thr), heap, mysql_table, &err);
+	if (err != DB_SUCCESS) {
+		return(err);
+	}
+
 	if (mode != BTR_MODIFY_TREE) {
 		ut_ad((mode & ~BTR_ALREADY_S_LATCHED) == BTR_MODIFY_LEAF);
 
@@ -1266,6 +1270,11 @@ row_ins_foreign_check_on_constraint(
 						 clust_index, tmp_heap);
 	}
 
+	if (cascade->is_delete && foreign->v_cols != NULL
+	    && foreign->v_cols->size() > 0
+	    && table->vc_templ == NULL) {
+		innobase_init_vc_templ(table);
+	}
 	if (node->is_delete
 	    ? (foreign->type & DICT_FOREIGN_ON_DELETE_SET_NULL)
 	    : (foreign->type & DICT_FOREIGN_ON_UPDATE_SET_NULL)) {
@@ -1618,7 +1627,8 @@ row_ins_check_foreign_constraint(
 
 	if (check_table == NULL
 	    || check_table->ibd_file_missing
-	    || check_index == NULL) {
+	    || check_index == NULL
+	    || fil_space_is_being_truncated(check_table->space)) {
 
 		if (!srv_read_only_mode && check_ref) {
 			FILE*	ef = dict_foreign_err_file;
@@ -1640,7 +1650,8 @@ row_ins_check_foreign_constraint(
 			ut_print_name(ef, trx,
 				      foreign->referenced_table_name);
 			fputs("\nor its .ibd file does"
-			      " not currently exist!\n", ef);
+			      " not currently exist!, or"
+			      " is undergoing truncate!\n", ef);
 			mutex_exit(&dict_foreign_err_mutex);
 
 			err = DB_NO_REFERENCED_ROW;
@@ -1856,6 +1867,11 @@ do_possible_lock_wait:
 
 		thr->lock_state = QUE_THR_LOCK_NOLOCK;
 
+		if(trx->error_state != DB_SUCCESS) {
+		    err = trx->error_state;
+		    goto exit_func;
+		}
+
 		DBUG_PRINT("to_be_dropped",
 			   ("table: %s", check_table->name.m_name));
 		if (check_table->to_be_dropped) {
@@ -1873,6 +1889,7 @@ exit_func:
 		mem_heap_free(heap);
 	}
 
+	DEBUG_SYNC_C("finished_scanning_index");
 	DBUG_RETURN(err);
 }
 
@@ -3231,6 +3248,7 @@ row_ins_index_entry_big_rec_func(
 	ut_ad(dict_index_is_clust(index));
 
 	DEBUG_SYNC_C_IF_THD(thd, "before_row_ins_extern_latch");
+	DEBUG_SYNC_C("before_insertion_of_blob");
 
 	mtr_start(&mtr);
 	mtr.set_named_space(index->space);

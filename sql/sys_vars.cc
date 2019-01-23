@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2009, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -61,6 +61,9 @@
 #include "transaction.h"                 // trans_commit_stmt
 #include "rpl_write_set_handler.h"       // transaction_write_set_hashing_algorithms
 #include "rpl_group_replication.h"       // is_group_replication_running
+#ifdef _WIN32
+#include "named_pipe.h"
+#endif
 
 #ifdef WITH_PERFSCHEMA_STORAGE_ENGINE
 #include "../storage/perfschema/pfs_server.h"
@@ -748,7 +751,7 @@ static Sys_var_int32 Sys_binlog_max_flush_queue_time(
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0),
        DEPRECATED(""));
 
-static Sys_var_ulong Sys_binlog_group_commit_sync_delay(
+static Sys_var_long Sys_binlog_group_commit_sync_delay(
        "binlog_group_commit_sync_delay",
        "The number of microseconds the server waits for the "
        "binary log group commit sync queue to fill before "
@@ -1104,6 +1107,7 @@ static bool repository_check(sys_var *self, THD *thd, set_var *var, SLAVE_THD_TY
 
   if (mi != NULL)
   {
+    mi->channel_wrlock();
     lock_slave_threads(mi);
     init_thread_mask(&running, mi, FALSE);
     if(!running)
@@ -1153,6 +1157,7 @@ static bool repository_check(sys_var *self, THD *thd, set_var *var, SLAVE_THD_TY
       my_error(ER_SLAVE_CHANNEL_MUST_STOP, MYF(0),mi->get_channel());
     }
     unlock_slave_threads(mi);
+    mi->channel_unlock();
   }
   channel_map.unlock();
 #endif
@@ -1873,6 +1878,18 @@ static bool transaction_write_set_check(sys_var *self, THD *thd, set_var *var)
              var->var->name.str);
     return true;
   }
+  /*
+    Disallow changing variable 'transaction_write_set_extraction' while
+    binlog_transaction_dependency_tracking is different from COMMIT_ORDER.
+  */
+  if (mysql_bin_log.m_dependency_tracker.m_opt_tracking_mode
+      != DEPENDENCY_TRACKING_COMMIT_ORDER)
+  {
+    my_error(ER_WRONG_USAGE, MYF(0),
+             "transaction_write_set_extraction (changed)",
+             "binlog_transaction_dependency_tracking (!= COMMIT_ORDER)");
+    return true;
+  }
   return false;
 }
 
@@ -2526,7 +2543,39 @@ static Sys_var_mybool Sys_named_pipe(
        "named_pipe", "Enable the named pipe (NT)",
        READ_ONLY GLOBAL_VAR(opt_enable_named_pipe), CMD_LINE(OPT_ARG),
        DEFAULT(FALSE));
-#endif
+#ifndef EMBEDDED_LIBRARY
+
+static PolyLock_rwlock PLock_named_pipe_full_access_group(
+  &LOCK_named_pipe_full_access_group);
+static bool check_named_pipe_full_access_group(sys_var *self, THD *thd,
+  set_var *var)
+{
+  if (!var->value) return false;  // DEFAULT is ok
+
+  if (!is_valid_named_pipe_full_access_group(
+    var->save_result.string_value.str))
+  {
+    my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), self->name.str,
+      var->save_result.string_value.str);
+    return true;
+  }
+  return false;
+}
+static bool fix_named_pipe_full_access_group(sys_var *, THD *, enum_var_type) {
+  return update_named_pipe_full_access_group(named_pipe_full_access_group);
+}
+static Sys_var_charptr Sys_named_pipe_full_access_group(
+  "named_pipe_full_access_group",
+  "Name of Windows group granted full access to the named pipe",
+  GLOBAL_VAR(named_pipe_full_access_group),
+  CMD_LINE(REQUIRED_ARG, OPT_NAMED_PIPE_FULL_ACCESS_GROUP), IN_FS_CHARSET,
+  DEFAULT(DEFAULT_NAMED_PIPE_FULL_ACCESS_GROUP),
+  &PLock_named_pipe_full_access_group, NOT_IN_BINLOG,
+  ON_CHECK(check_named_pipe_full_access_group),
+  ON_UPDATE(fix_named_pipe_full_access_group));
+
+#endif /* EMBEDDED_LIBRARY */
+#endif /* _WIN32 */
 
 
 static bool 
@@ -3548,6 +3597,55 @@ static Sys_var_enum Mts_parallel_type(
        NOT_IN_BINLOG, ON_CHECK(check_slave_stopped),
        ON_UPDATE(NULL));
 
+static bool check_binlog_transaction_dependency_tracking(sys_var *self, THD *thd, set_var *var)
+{
+  if (global_system_variables.transaction_write_set_extraction == HASH_ALGORITHM_OFF
+      && var->save_result.ulonglong_value != DEPENDENCY_TRACKING_COMMIT_ORDER)
+  {
+    my_error(ER_WRONG_USAGE, MYF(0),
+             "binlog_transaction_dependency_tracking (!= COMMIT_ORDER)",
+             "transaction_write_set_extraction (= OFF)");
+
+    return true;
+  }
+  return false;
+}
+
+static bool update_binlog_transaction_dependency_tracking(sys_var* var, THD* thd, enum_var_type v)
+{
+  /*
+    the writeset_history_start needs to be set to 0 whenever there is a
+    change in the transaction dependency source so that WS and COMMIT
+    transition smoothly.
+  */
+  mysql_bin_log.m_dependency_tracker.tracking_mode_changed();
+  return false;
+}
+
+static PolyLock_mutex
+PLock_slave_trans_dep_tracker(&LOCK_slave_trans_dep_tracker);
+static const char *opt_binlog_transaction_dependency_tracking_names[]=
+       {"COMMIT_ORDER", "WRITESET", "WRITESET_SESSION", NullS};
+static Sys_var_enum Binlog_transaction_dependency_tracking(
+       "binlog_transaction_dependency_tracking",
+       "Selects the source of dependency information from which to "
+       "assess which transactions can be executed in parallel by the "
+       "slave's multi-threaded applier. "
+       "Possible values are COMMIT_ORDER, WRITESET and WRITESET_SESSION.",
+       GLOBAL_VAR(mysql_bin_log.m_dependency_tracker.m_opt_tracking_mode),
+       CMD_LINE(REQUIRED_ARG), opt_binlog_transaction_dependency_tracking_names,
+       DEFAULT(DEPENDENCY_TRACKING_COMMIT_ORDER),
+       &PLock_slave_trans_dep_tracker,
+       NOT_IN_BINLOG, ON_CHECK(check_binlog_transaction_dependency_tracking),
+       ON_UPDATE(update_binlog_transaction_dependency_tracking));
+static Sys_var_ulong Binlog_transaction_dependency_history_size(
+       "binlog_transaction_dependency_history_size",
+       "Maximum number of rows to keep in the writeset history.",
+       GLOBAL_VAR(mysql_bin_log.m_dependency_tracker.get_writeset()->m_opt_max_history_size),
+       CMD_LINE(REQUIRED_ARG, 0), VALID_RANGE(1, 1000000), DEFAULT(25000),
+       BLOCK_SIZE(1), &PLock_slave_trans_dep_tracker, NOT_IN_BINLOG, ON_CHECK(NULL),
+       ON_UPDATE(NULL));
+
 static Sys_var_mybool Sys_slave_preserve_commit_order(
        "slave_preserve_commit_order",
        "Force slave workers to make commits in the same order as on the master. "
@@ -3562,6 +3660,12 @@ bool Sys_var_enum_binlog_checksum::global_update(THD *thd, set_var *var)
 {
   bool check_purge= false;
 
+  /*
+    SET binlog_checksome command should ignore 'read-only' and 'super_read_only'
+    options so that it can update 'mysql.gtid_executed' replication repository
+    table.
+  */
+  thd->set_skip_readonly_check();
   mysql_mutex_lock(mysql_bin_log.get_log_lock());
   if(mysql_bin_log.is_open())
   {
@@ -3719,6 +3823,22 @@ static bool check_sql_mode(sys_var *self, THD *thd, set_var *var)
                           ER_WARN_DEPRECATED_SQLMODE,
                           ER_THD(thd, ER_WARN_DEPRECATED_SQLMODE),
                           "NO_AUTO_CREATE_USER");
+    }
+    static const sql_mode_t deprecated_mask= MODE_DB2 | MODE_MAXDB |
+      MODE_MSSQL | MODE_MYSQL323 | MODE_MYSQL40 | MODE_ORACLE |
+      MODE_POSTGRESQL | MODE_NO_FIELD_OPTIONS | MODE_NO_KEY_OPTIONS |
+      MODE_NO_TABLE_OPTIONS;
+    sql_mode_t deprecated_modes=
+      var->save_result.ulonglong_value & deprecated_mask;
+    if (deprecated_modes != 0)
+    {
+      LEX_STRING buf;
+      if (sql_mode_string_representation(thd, deprecated_modes, &buf))
+        return true; // OOM
+      push_warning_printf(thd, Sql_condition::SL_WARNING,
+                          ER_WARN_DEPRECATED_SQLMODE,
+                          ER_THD(thd, ER_WARN_DEPRECATED_SQLMODE),
+                          buf.str);
     }
   }
 
@@ -5814,6 +5934,15 @@ static Sys_var_charptr Sys_disabled_storage_engines(
        READ_ONLY GLOBAL_VAR(opt_disabled_storage_engines),
        CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET,
        DEFAULT(""));
+
+static Sys_var_mybool Sys_show_create_table_verbosity(
+       "show_create_table_verbosity",
+       "When this option is enabled, it increases the verbosity of "
+       "'SHOW CREATE TABLE'.",
+        SESSION_VAR(show_create_table_verbosity),
+        CMD_LINE(OPT_ARG),
+        DEFAULT(FALSE), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+        ON_CHECK(0), ON_UPDATE(0));
 
 static bool check_keyring_access(sys_var*, THD* thd, set_var*)
 {

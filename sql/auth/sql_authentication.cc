@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -189,9 +189,9 @@ Rsa_authentication_keys::read_key_file(RSA **key_ptr,
   */
   if ((key_file= fopen(key_file_path.c_ptr(), "r")) == NULL)
   {
-    sql_print_information("RSA %s key file not found: %s."
-                          " Some authentication plugins will not work.",
-                          key_type, key_file_path.c_ptr());
+    sql_print_warning("RSA %s key file not found: %s."
+                      " Some authentication plugins will not work.",
+                      key_type, key_file_path.c_ptr());
   }
   else
   {
@@ -460,7 +460,11 @@ bool auth_plugin_supports_expiration(const char *plugin_name)
 static void login_failed_error(MPVIO_EXT *mpvio, int passwd_used)
 {
   THD *thd= current_thd;
-  if (passwd_used == 2)
+
+  if (thd->is_error())
+    sql_print_information("%s", thd->get_stmt_da()->message_text());
+
+  else if (passwd_used == 2)
   {
     my_error(ER_ACCESS_DENIED_NO_PASSWORD_ERROR, MYF(0),
              mpvio->auth_info.user_name,
@@ -883,7 +887,7 @@ static bool acl_check_ssl(THD *thd, const ACL_USER *acl_user)
 {
 #if defined(HAVE_OPENSSL)
   Vio *vio= thd->get_protocol_classic()->get_vio();
-  SSL *ssl= thd->get_protocol()->get_ssl();
+  SSL *ssl= (SSL*) vio->ssl_arg;
   X509 *cert;
 #endif /* HAVE_OPENSSL */
 
@@ -1988,7 +1992,8 @@ server_mpvio_initialize(THD *thd, MPVIO_EXT *mpvio,
   mpvio->auth_info.host_or_ip_length= sctx_host_or_ip.length;
 
 #if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
-  if (thd->get_protocol()->get_ssl())
+  Vio *vio= thd->get_protocol_classic()->get_vio();
+  if (vio->ssl_arg)
     mpvio->vio_is_encrypted= 1;
   else
 #endif /* HAVE_OPENSSL && !EMBEDDED_LIBRARY */
@@ -2195,8 +2200,7 @@ acl_authenticate(THD *thd, enum_server_command command)
     if (parse_com_change_user_packet(&mpvio,
                                      mpvio.protocol->get_packet_length()))
     {
-      if (!thd->is_error())
-        login_failed_error(&mpvio, mpvio.auth_info.password_used);
+      login_failed_error(&mpvio, mpvio.auth_info.password_used);
       server_mpvio_update_thd(thd, &mpvio);
       DBUG_RETURN(1);
     }
@@ -2314,8 +2318,7 @@ acl_authenticate(THD *thd, enum_server_command command)
       acl_log_connect(mpvio.auth_info.user_name, mpvio.auth_info.host_or_ip,
         mpvio.auth_info.authenticated_as, mpvio.db.str, thd, command);
     }
-    if (!thd->is_error())
-      login_failed_error(&mpvio, mpvio.auth_info.password_used);
+    login_failed_error(&mpvio, mpvio.auth_info.password_used);
     DBUG_RETURN (1);
   }
 
@@ -2354,8 +2357,7 @@ acl_authenticate(THD *thd, enum_server_command command)
         Host_errors errors;
         errors.m_proxy_user= 1;
         inc_host_errors(mpvio.ip, &errors);
-        if (!thd->is_error())
-          login_failed_error(&mpvio, mpvio.auth_info.password_used);
+        login_failed_error(&mpvio, mpvio.auth_info.password_used);
         DBUG_RETURN(1);
       }
 
@@ -2374,8 +2376,7 @@ acl_authenticate(THD *thd, enum_server_command command)
         Host_errors errors;
         errors.m_proxy_user_acl= 1;
         inc_host_errors(mpvio.ip, &errors);
-        if (!thd->is_error())
-          login_failed_error(&mpvio, mpvio.auth_info.password_used);
+        login_failed_error(&mpvio, mpvio.auth_info.password_used);
         mysql_mutex_unlock(&acl_cache->lock);
         DBUG_RETURN(1);
       }
@@ -2413,8 +2414,7 @@ acl_authenticate(THD *thd, enum_server_command command)
       Host_errors errors;
       errors.m_ssl= 1;
       inc_host_errors(mpvio.ip, &errors);
-      if (!thd->is_error())
-        login_failed_error(&mpvio, thd->password);
+      login_failed_error(&mpvio, thd->password);
       DBUG_RETURN(1);
     }
 
@@ -2540,6 +2540,7 @@ acl_authenticate(THD *thd, enum_server_command command)
       Host_errors errors;
       errors.m_default_database= 1;
       inc_host_errors(mpvio.ip, &errors);
+      login_failed_error(&mpvio, mpvio.auth_info.password_used);
       DBUG_RETURN(1);
     }
   }
@@ -3358,7 +3359,24 @@ public:
   RSA *operator()(void)
   {
     /* generate RSA keys */
-    RSA *rsa= RSA_generate_key(m_key_size, m_exponent, NULL, NULL);
+    RSA *rsa= RSA_new();
+    if (!rsa)
+      return NULL;
+    BIGNUM *e= BN_new();
+    if (!e)
+    {
+      RSA_free(rsa);
+      return NULL;
+    }
+    if (!BN_set_word(e, m_exponent) ||
+        !RSA_generate_key_ex(rsa, m_key_size, e, NULL))
+    {
+      RSA_free(rsa);
+      BN_free(e);
+      return NULL;
+    }
+    BN_free(e);
+
     return rsa; // pass ownership
   }
 

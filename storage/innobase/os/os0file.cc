@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2009, Percona Inc.
 
 Portions of this file contain modifications contributed and copyrighted
@@ -209,6 +209,8 @@ mysql_pfs_key_t  innodb_temp_file_key;
 
 /** The asynchronous I/O context */
 struct Slot {
+	Slot() { memset(this, 0, sizeof(*this)); }
+
 	/** index of the slot in the aio array */
 	uint16_t		pos;
 
@@ -825,7 +827,7 @@ os_file_io_complete(
 	byte*		buf,
 	byte*		scratch,
 	ulint		src_len,
-	ulint		offset,
+	os_offset_t	offset,
 	ulint		len);
 
 /** Does simulated AIO. This function should be called by an i/o-handler
@@ -969,8 +971,7 @@ public:
 		return(os_file_io_complete(
 				slot->type, slot->file.m_file, slot->buf,
 				NULL, slot->original_len,
-				static_cast<ulint>(slot->offset),
-				slot->len));
+				slot->offset, slot->len));
 	}
 
 private:
@@ -1690,7 +1691,7 @@ os_file_io_complete(
 	byte*		buf,
 	byte*		scratch,
 	ulint		src_len,
-	ulint		offset,
+	os_offset_t	offset,
 	ulint		len)
 {
 	/* We never compress/decompress the first page */
@@ -2086,6 +2087,8 @@ os_file_compress_page(
 		old_compressed_len = ut_calc_align(
 			old_compressed_len + FIL_PAGE_DATA,
 			type.block_size());
+	} else {
+		old_compressed_len = *n;
 	}
 
 	byte*	compressed_page;
@@ -2343,6 +2346,9 @@ LinuxAIOHandler::resubmit(Slot* slot)
 	slot->n_bytes = 0;
 	slot->io_already_done = false;
 
+	/* make sure that slot->offset fits in off_t */
+	ut_ad(sizeof(off_t) >= sizeof(os_offset_t));
+
 	struct iocb*	iocb = &slot->control;
 	if (slot->type.is_read()) {
 		io_prep_pread(
@@ -2350,7 +2356,7 @@ LinuxAIOHandler::resubmit(Slot* slot)
 			slot->file.m_file,
 			slot->ptr,
 			slot->len,
-			static_cast<off_t>(slot->offset));
+			slot->offset);
 
 	} else {
 
@@ -2361,7 +2367,7 @@ LinuxAIOHandler::resubmit(Slot* slot)
 			slot->file.m_file,
 			slot->ptr,
 			slot->len,
-			static_cast<off_t>(slot->offset));
+			slot->offset);
 	}
 
 	iocb->data = slot;
@@ -3075,20 +3081,8 @@ os_file_fsync_posix(
 
 		case EIO:
 
-			++failures;
-			ut_a(failures < 1000);
-
-			if (!(failures % 100)) {
-
-				ib::warn()
-					<< "fsync(): "
-					<< "An error occurred during "
-					<< "synchronization,"
-					<< " retrying";
-			}
-
-			/* 0.2 sec */
-			os_thread_sleep(200000);
+                        ib::fatal()
+				<< "fsync() returned EIO, aborting.";
 			break;
 
 		case EINTR:
@@ -3128,7 +3122,8 @@ os_file_status_posix(
 	if (!ret) {
 		/* file exists, everything OK */
 
-	} else if (errno == ENOENT || errno == ENOTDIR) {
+	} else if (errno == ENOENT || errno == ENOTDIR
+		   || errno == ENAMETOOLONG) {
 		/* file does not exist */
 		return(true);
 
@@ -4158,7 +4153,8 @@ os_file_status_win32(
 	if (!ret) {
 		/* file exists, everything OK */
 
-	} else if (errno == ENOENT || errno == ENOTDIR) {
+	} else if (errno == ENOENT || errno == ENOTDIR
+		  || errno == ENAMETOOLONG) {
 		/* file does not exist */
 		return(true);
 
@@ -5449,8 +5445,7 @@ os_file_io(
 				*err = os_file_io_complete(
 					type, file,
 					reinterpret_cast<byte*>(buf),
-					NULL, original_n,
-					static_cast<ulint>(offset), n);
+					NULL, original_n, offset, n);
 			} else {
 
 				*err = DB_SUCCESS;
@@ -6301,7 +6296,7 @@ AIO::AIO(
 	m_not_full = os_event_create("aio_not_full");
 	m_is_empty = os_event_create("aio_is_empty");
 
-	memset(&m_slots[0], 0x0, sizeof(m_slots[0]) * m_slots.size());
+	std::uninitialized_fill(m_slots.begin(), m_slots.end(), Slot());
 #ifdef LINUX_NATIVE_AIO
 	memset(&m_events[0], 0x0, sizeof(m_events[0]) * m_events.size());
 #endif /* LINUX_NATIVE_AIO */
@@ -7003,7 +6998,7 @@ AIO::reserve_slot(
 #else
 		slot->len = static_cast<ulint>(compressed_len);
 #endif /* _WIN32 */
-		slot->skip_punch_hole = type.punch_hole();
+		slot->skip_punch_hole = !type.punch_hole();
 
 		acquire();
 	}

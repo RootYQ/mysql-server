@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 # -*- cperl -*-
 
-# Copyright (c) 2004, 2017, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2004, 2018, Oracle and/or its affiliates. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -78,6 +78,7 @@ BEGIN {
 use lib "lib";
 
 use Cwd;
+use Cwd 'abs_path';
 use Getopt::Long;
 use My::File::Path; # Patched version of File::Path
 use File::Basename;
@@ -137,7 +138,6 @@ my $opt_start_exit;
 my $start_only;
 
 our $num_tests_for_report;      # for test-progress option
-our $remaining;
 
 my $auth_plugin;                # the path to the authentication test plugin
 
@@ -284,7 +284,7 @@ my $opt_skip_core;
 
 our $opt_check_testcases= 1;
 my $opt_mark_progress;
-our $opt_test_progress;
+our $opt_test_progress= 1;
 my $opt_max_connections;
 our $opt_report_times= 0;
 
@@ -428,9 +428,7 @@ sub main {
 
   #######################################################################
   my $num_tests= @$tests;
-
   $num_tests_for_report = $num_tests * $opt_repeat;
-  $remaining= $num_tests_for_report;
 
   if ( $opt_parallel eq "auto" ) {
     # Try to find a suitable value for number of workers
@@ -694,13 +692,16 @@ sub run_test_server ($$$) {
 	      mtr_report(" - skipping '$worker_savedir/'");
 	      rmtree($worker_savedir);
 	    }
-	    else {
-	      rename($worker_savedir, $savedir);
-              #look for the test.log file and put in savedir
-	      my $logf= "$result->{shortname}" . ".log";
-              my $logfilepath= dirname($worker_savedir); 
-              move($logfilepath . "/" . $logf, $savedir);
-	      mtr_report(" - the logfile can be found in '$savedir/$logf'");
+            else
+            {
+              rename($worker_savedir, $savedir) if $worker_savedir ne $savedir;
+
+              # Look for the test log file and put that in savedir location
+              my $logfile= "$result->{shortname}" . ".log";
+              my $logfilepath= dirname($worker_savedir) . "/" . $logfile;
+              move($logfilepath, $savedir);
+              mtr_report(" - the logfile can be found in '$savedir/$logfile'");
+
 	      # Move any core files from e.g. mysqltest
 	      foreach my $coref (glob("core*"), glob("*.dmp"))
 	      {
@@ -769,21 +770,17 @@ sub run_test_server ($$$) {
 	    # too many times already
 	    my $tname= $result->{name};
 	    my $failures= $result->{failures};
-	    if ($opt_retry > 1 and $failures >= $opt_retry_failure){
+	    if ($opt_retry > 1 and $failures >= $opt_retry_failure)
+            {
 	      mtr_report("\nTest $tname has failed $failures times,",
 			 "no more retries!\n");
 	    }
-	    else {
+	    else
+            {
 	      mtr_report("\nRetrying test $tname, ".
 			 "attempt($retries/$opt_retry)...\n");
-              #saving the log file as filename.failed in case of retry
-              if ( $result->is_failed() ) {
-                my $worker_logdir= $result->{savedir};
-                my $log_file_name=dirname($worker_logdir)."/".$result->{shortname}.".log";
-                rename $log_file_name,$log_file_name.".failed";
-              }
 	      delete($result->{result});
-	      $result->{retries}= $retries+1;
+	      $result->{retries}= $retries + 1;
 	      $result->write_test($sock, 'TESTCASE');
 	      next;
 	    }
@@ -1160,7 +1157,7 @@ sub command_line_setup {
              'record'                   => \$opt_record,
              'check-testcases!'         => \$opt_check_testcases,
              'mark-progress'            => \$opt_mark_progress,
-             'test-progress'            => \$opt_test_progress,
+             'test-progress:1'          => \$opt_test_progress,
 
              # Extra options used when starting mysqld
              'mysqld=s'                 => \@opt_extra_mysqld_opt,
@@ -1438,6 +1435,10 @@ sub command_line_setup {
     {
       push(@opt_cases, $arg);
     }
+  }
+
+  if ($opt_test_progress != 0 and $opt_test_progress != 1) {
+    mtr_error("Invalid value '$opt_test_progress' for option 'test-progress'.");
   }
 
   # disable syslog / EventLog in normal (non-bootstrap) operation.
@@ -2359,6 +2360,7 @@ sub mysql_client_test_arguments(){
   my $exe;
   # mysql_client_test executable may _not_ exist
   $exe= mtr_exe_maybe_exists(vs_config_dirs('testclients', 'mysql_client_test'),
+                             "$path_client_bindir/mysql_client_test",
 			     "$basedir/testclients/mysql_client_test",
 			     "$basedir/bin/mysql_client_test");
   return "" unless $exe;
@@ -2604,20 +2606,21 @@ sub environment_setup {
   $ENV{'DEFAULT_MASTER_PORT'}= $mysqld_variables{'port'};
   $ENV{'MYSQL_TMP_DIR'}=      $opt_tmpdir;
   $ENV{'MYSQLTEST_VARDIR'}=   $opt_vardir;
+  $ENV{'MYSQL_TEST_DIR_ABS'}= getcwd();
   $ENV{'MYSQL_BINDIR'}=       "$bindir";
   $ENV{'MYSQL_SHAREDIR'}=     $path_language;
   $ENV{'MYSQL_CHARSETSDIR'}=  $path_charsetsdir;
   if (IS_WINDOWS)
   {
     $ENV{'SECURE_LOAD_PATH'}= $glob_mysql_test_dir."\\std_data";
-    $ENV{'MYSQL_TEST_LOGIN_FILE'}=
-                              $opt_tmpdir . "\\.mylogin.cnf";
+    $ENV{'MYSQL_TEST_LOGIN_FILE'}= $opt_tmpdir . "\\.mylogin.cnf";
+    $ENV{'MYSQLTEST_VARDIR_ABS'}= $opt_vardir;
   }
   else
   {
     $ENV{'SECURE_LOAD_PATH'}= $glob_mysql_test_dir."/std_data";
-    $ENV{'MYSQL_TEST_LOGIN_FILE'}=
-                              $opt_tmpdir . "/.mylogin.cnf";
+    $ENV{'MYSQL_TEST_LOGIN_FILE'}= $opt_tmpdir . "/.mylogin.cnf";
+    $ENV{'MYSQLTEST_VARDIR_ABS'}= abs_path("$opt_vardir");
   }
     
 
@@ -2851,7 +2854,9 @@ sub environment_setup {
   $ENV{'VALGRIND_TEST'}= $opt_valgrind;
 
   # Make sure LeakSanitizer exits if leaks are found
-  $ENV{'LSAN_OPTIONS'}= "exitcode=42";
+  $ENV{'LSAN_OPTIONS'} = "exitcode=42,suppressions=${glob_mysql_test_dir}/lsan.supp";
+
+  $ENV{'ASAN_OPTIONS'} = "suppressions=${glob_mysql_test_dir}/asan.supp";
 
   # Add dir of this perl to aid mysqltest in finding perl
   my $perldir= dirname($^X);
@@ -4040,6 +4045,10 @@ sub mysql_install_db {
   mtr_tofile($bootstrap_sql_file,
              sql_to_bootstrap(mtr_grab_file("include/mtr_check.sql")));
 
+  # Create directories mysql and test
+  mkpath("$install_datadir/mysql");
+  mkpath("$install_datadir/test");
+
   if ( $opt_manual_boot_gdb )
   {
     # The configuration has been set up and user has been prompted for
@@ -4054,10 +4063,6 @@ sub mysql_install_db {
   my $path_bootstrap_log= "$opt_vardir/log/bootstrap.log";
   mtr_tofile($path_bootstrap_log,
 	     "$exe_mysqld_bootstrap " . join(" ", @$args) . "\n");
-
-  # Create directories mysql and test
-  mkpath("$install_datadir/mysql");
-  mkpath("$install_datadir/test");
 
   if ( My::SafeProcess->run
        (
@@ -5380,7 +5385,7 @@ sub check_warnings ($) {
 	  return $result;
 	}
 	# Wait for next process to exit
-	next;
+	next if not $result;
       }
       else
       {
@@ -7324,7 +7329,8 @@ Options for test case authoring
   record TESTNAME       (Re)genereate the result file for TESTNAME
   check-testcases       Check testcases for sideeffects
   mark-progress         Log line number and elapsed time to <testname>.progress
-  test-progress         Print the percentage of tests completed
+  test-progress[={0|1}] Print the percentage of tests completed. This setting
+                        is enabled by default.
 
 Options that pass on options (these may be repeated)
 

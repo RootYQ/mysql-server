@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2000, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2000, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -1804,8 +1804,7 @@ error_exit:
 			doc_ids difference should not exceed
 			FTS_DOC_ID_MAX_STEP value. */
 
-			if (next_doc_id > 1
-			    && doc_id - next_doc_id >= FTS_DOC_ID_MAX_STEP) {
+			if (doc_id - next_doc_id >= FTS_DOC_ID_MAX_STEP) {
 				 ib::error() << "Doc ID " << doc_id
 					<< " is too big. Its difference with"
 					" largest used Doc ID "
@@ -4338,11 +4337,12 @@ row_drop_table_for_mysql(
 		persistent storage if it exists and if there are stats for this
 		table in there. This function creates its own trx and commits
 		it. */
-		char	errstr[1024];
-		err = dict_stats_drop_table(name, errstr, sizeof(errstr));
-
-		if (err != DB_SUCCESS) {
-			ib::warn() << errstr;
+		if (dict_stats_is_persistent_enabled(table)) {
+			char	errstr[1024];
+			err = dict_stats_drop_table(name, errstr, sizeof(errstr));
+			if (err != DB_SUCCESS) {
+				ib::warn() << errstr;
+			}
 		}
 	}
 
@@ -5241,7 +5241,8 @@ row_rename_table_for_mysql(
 	pars_info_t*	info			= NULL;
 	int		retry;
 	bool		aux_fts_rename		= false;
-
+	bool		is_new_part;
+	bool		is_old_part;
 	ut_a(old_name != NULL);
 	ut_a(new_name != NULL);
 	ut_ad(trx->state == TRX_STATE_ACTIVE);
@@ -5256,7 +5257,17 @@ row_rename_table_for_mysql(
 		ib::error() << "Trying to create a MySQL system table "
 			<< new_name << " of type InnoDB. MySQL system tables"
 			" must be of the MyISAM type!";
+		goto funct_exit;
+	}
 
+	/* Check the table identifier length here. It is possible that when we
+	are renaming a temporary table back to original name (after alter)
+	the table identifier length can exceed the maximum file name limit */
+
+	if (strlen(strchr(new_name,'/') + 1) > FN_LEN ) {
+		my_error(ER_PATH_LENGTH, MYF(0),
+			 strchr(new_name,'/')+1);
+		err = DB_IDENTIFIER_TOO_LONG;
 		goto funct_exit;
 	}
 
@@ -5269,6 +5280,12 @@ row_rename_table_for_mysql(
 
 	table = dict_table_open_on_name(old_name, dict_locked, FALSE,
 					DICT_ERR_IGNORE_NONE);
+
+	is_old_part = strstr((char*)old_name, "#p#") ||
+	              strstr((char*)old_name, "#P");
+
+	is_new_part = strstr((char*)new_name, "#p#") ||
+	              strstr((char*)new_name, "#P");
 
 	if (!table) {
 		err = DB_TABLE_NOT_FOUND;
@@ -5302,6 +5319,45 @@ row_rename_table_for_mysql(
 			goto funct_exit;
 		}
 	}
+
+        /* To exchange a normal table(t1) with partition table (p1), the
+           rename logic is something like: 1) t1 -> tmp table 2) p1-> t1
+           3) tmp -> p1. And special handling of dict_table_t::data_dir_path
+           is necessary if DATA DIRECTORY is specified.
+           For example if DATA DIRECTORY Is '/tmp', the data directory for
+           nomral table is '/tmp/t1', while for partition is '/tmp'. So during
+           above rename step 2) and 3), the postfix table name 't1' should
+           either be truncated or appended.*/
+        if (old_is_tmp && is_new_part && table->data_dir_path != NULL) {
+		std::string str(table->data_dir_path);
+		size_t found = str.find_last_of("/\\");
+
+		ut_ad(found != std::string::npos);
+		found++;
+
+		table->data_dir_path[found] = '\0';
+
+        } else if (is_old_part && !is_new_part &&
+                   table->data_dir_path != NULL && !new_is_tmp) {
+
+		uint old_size = mem_heap_get_size(table->heap);
+
+		std::string str(table->data_dir_path);
+
+		/* new_name contains database/name but we require name */
+                const char *name = strchr(new_name, '/') + 1;
+
+                str.append(name);
+
+		table->data_dir_path =
+		    mem_heap_strdup(table->heap, str.c_str());
+
+		uint new_size = mem_heap_get_size(table->heap);
+
+		ut_ad(mutex_own(&dict_sys->mutex));
+
+		dict_sys->size += new_size - old_size;
+        }
 
 	/* Is a foreign key check running on this table? */
 	for (retry = 0; retry < 100
@@ -5382,8 +5438,8 @@ row_rename_table_for_mysql(
 
 	if (!new_is_tmp) {
 		/* Rename all constraints. */
-		char	new_table_name[MAX_TABLE_NAME_LEN] = "";
-		char	old_table_utf8[MAX_TABLE_NAME_LEN] = "";
+		char	new_table_name[MAX_TABLE_NAME_LEN + 1] = "";
+		char	old_table_utf8[MAX_TABLE_NAME_LEN + 1] = "";
 		uint	errors = 0;
 
 		strncpy(old_table_utf8, old_name, MAX_TABLE_NAME_LEN);
@@ -5488,6 +5544,9 @@ row_rename_table_for_mysql(
 			"    = TO_BINARY(:old_table_name);\n"
 			"END;\n"
 			, FALSE, trx);
+		if (err != DB_SUCCESS) {
+			goto end;
+		}
 
 	} else if (n_constraints_to_drop > 0) {
 		/* Drop some constraints of tmp tables. */
@@ -5507,8 +5566,9 @@ row_rename_table_for_mysql(
 		}
 	}
 
-	if (dict_table_has_fts_index(table)
-	    && !dict_tables_have_same_db(old_name, new_name)) {
+	if ((dict_table_has_fts_index(table)
+		|| DICT_TF2_FLAG_IS_SET(table, DICT_TF2_FTS_HAS_DOC_ID))
+		&& !dict_tables_have_same_db(old_name, new_name)) {
 		err = fts_rename_aux_tables(table, new_name, trx);
 		if (err != DB_TABLE_NOT_FOUND) {
 			aux_fts_rename = true;

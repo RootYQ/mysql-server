@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -267,9 +267,10 @@ row_upd_check_references_constraints(
 			if it is interrupted. So if the foreign table is
 			undergoing a truncate, ignore the FK check. */
 
-			if (foreign_table != NULL
-			    && fil_space_is_being_truncated(
-						foreign_table->space)) {
+			if (foreign_table != NULL &&
+			   (dict_table_is_discarded(foreign_table)
+			    || fil_space_is_being_truncated(
+						foreign_table->space))) {
 				continue;
 			}
 
@@ -876,8 +877,9 @@ the equal ordering fields. NOTE: we compare the fields as binary strings!
 @param[in]	heap		memory heap from which allocated
 @param[in]	mysql_table	NULL, or mysql table object when
 				user thread invokes dml
+@param[out]	error		error number in case of failure
 @return own: update vector of differing fields, excluding roll ptr and
-trx id */
+trx id,if error is not equal to DB_SUCCESS, return NULL */
 upd_t*
 row_upd_build_difference_binary(
 	dict_index_t*	index,
@@ -887,7 +889,8 @@ row_upd_build_difference_binary(
 	bool		no_sys,
 	trx_t*		trx,
 	mem_heap_t*	heap,
-	TABLE*		mysql_table)
+	TABLE*		mysql_table,
+	dberr_t*	error)
 {
 	upd_field_t*	upd_field;
 	dfield_t*	dfield;
@@ -993,6 +996,10 @@ row_upd_build_difference_binary(
 				update->old_vrow, col, index,
 				&v_heap, heap, NULL, thd, mysql_table,
 				NULL, NULL, NULL);
+			if (vfield == NULL) {
+				*error = DB_COMPUTE_VALUE_FAILED;
+				return(NULL);
+			}
 
 			if (!dfield_data_is_binary_equal(
 				dfield, vfield->len,
@@ -1979,6 +1986,7 @@ row_upd_store_v_row(
 				}
 
 				dfield_copy_data(dfield, upd_field->old_v_val);
+				dfield_dup(dfield, node->heap);
 				break;
 			}
 
@@ -1999,6 +2007,7 @@ row_upd_store_v_row(
 								update->old_vrow,
 								col_no);
 						dfield_copy_data(dfield, vfield);
+						dfield_dup(dfield, node->heap);
 					}
 				} else {
 					/* Need to compute, this happens when

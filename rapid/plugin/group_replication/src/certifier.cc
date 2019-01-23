@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -24,6 +24,8 @@
 #include "sql_service_command.h"
 
 const std::string Certifier::GTID_EXTRACTED_NAME= "gtid_extracted";
+const std::string Certifier::CERTIFICATION_INFO_ERROR_NAME =
+    "certification_info_error";
 
 static void *launch_broadcast_thread(void* arg)
 {
@@ -1230,7 +1232,7 @@ void Certifier::garbage_collect()
   stable_gtid_set_lock->wrlock();
   while (it != certification_info.end())
   {
-    if (it->second->is_subset(stable_gtid_set))
+    if (it->second->is_subset_not_equals(stable_gtid_set))
     {
       if (it->second->unlink() == 0)
         delete it->second;
@@ -1548,6 +1550,18 @@ int Certifier::set_certification_info(std::map<std::string, std::string> *cert_i
 {
   DBUG_ENTER("Certifier::set_certification_info");
   DBUG_ASSERT(cert_info != NULL);
+
+  if (cert_info->size() == 1) {
+    std::map<std::string, std::string>::iterator it =
+        cert_info->find(CERTIFICATION_INFO_ERROR_NAME);
+    if (it != cert_info->end()) {
+      log_message(MY_ERROR_LEVEL,
+                  "The certification information could not be set in this server: '%s'",
+                  it->second.c_str());
+      DBUG_RETURN(1);
+    }
+  }
+
   mysql_mutex_lock(&LOCK_certification_info);
 
   clear_certification_info();

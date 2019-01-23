@@ -1,4 +1,4 @@
-/* Copyright (c) 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2017, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -36,18 +36,18 @@ void Sasl_client::interact(sasl_interact_t *ilist)
       the name of the user authenticating
     */
     case SASL_CB_USER:
-      ilist->result= strdup(m_user_name);
+      ilist->result= m_user_name;
       ilist->len= strlen((const char*)ilist->result);
       break;
     /* the name of the user acting for. (for example postman delivering mail for
        Martin might have an AUTHNAME of postman and a USER of Martin)
     */
     case SASL_CB_AUTHNAME:
-      ilist->result= strdup(m_user_name);
+      ilist->result= m_user_name;
       ilist->len= strlen((const char*)ilist->result);
       break;
     case SASL_CB_PASS:
-      ilist->result= strdup(m_user_pwd);
+      ilist->result= m_user_pwd;
       ilist->len= strlen((const char*)ilist->result);
       break;
     default:
@@ -74,19 +74,46 @@ void Sasl_client::set_plugin_info(MYSQL_PLUGIN_VIO *vio,  MYSQL *mysql)
 */
 int Sasl_client::read_method_name_from_server()
 {
-  int rc_server_read= CR_ERROR;
+  int rc_server_read= -1;
   unsigned char* packet= NULL;
   std::stringstream log_stream;
+  /*
+    We are assuming that there will be only one method name passed by
+    server, and length of the method name will not exceed 256 chars.
+  */
+  const int max_method_name_len= 256;
+
   if (m_vio == NULL)
   {
     return rc_server_read;
   }
   /** Get authentication method from the server. */
   rc_server_read= m_vio->read_packet(m_vio, (unsigned char**)&packet);
-  strncpy(m_mechanism, (const char*)packet, sizeof(m_mechanism)-1);
-  m_mechanism[sizeof(m_mechanism)-1]= '\0';
-  log_stream << "Sasl_client::read_method_name_from_server : " << m_mechanism;
-  log_dbg(log_stream.str());
+  if (rc_server_read >= 0 && rc_server_read <= max_method_name_len)
+  {
+    strncpy(m_mechanism, (const char*)packet, rc_server_read);
+    m_mechanism[rc_server_read]= '\0';
+    log_stream << "Sasl_client::read_method_name_from_server : "
+               << m_mechanism;
+    log_dbg(log_stream.str());
+  }
+  else if (rc_server_read > max_method_name_len)
+  {
+    rc_server_read= -1;
+    m_mechanism[0]= '\0';
+    log_stream << "Sasl_client::read_method_name_from_server : Method name "
+               << "is greater then allowed limit of 256 characters.";
+    log_error(log_stream.str());
+  }
+  else
+  {
+    m_mechanism[0]= '\0';
+    log_stream << "Sasl_client::read_method_name_from_server : Plugin has "
+               << "failed to read the method name, make sure that default "
+               << "authentication plugin and method name specified at "
+               << "server are correct.";
+    log_error(log_stream.str());
+  }
   return rc_server_read;
 }
 
@@ -101,6 +128,36 @@ int Sasl_client::initilize()
 {
   std::stringstream log_stream;
   int rc_sasl= SASL_FAIL;
+#ifdef _WIN32
+  char sasl_plugin_dir[MAX_PATH]= "";
+  int ret_executable_path= 0;
+  /**
+    Getting the current executable path, SASL SCRAM dll will be copied in executable path.
+    Using/Setting the path from cmake file may not work as during installation SASL SCRAM DLL may be
+    copied to any path based on installable path.
+  */
+  ret_executable_path= GetModuleFileName(NULL, sasl_plugin_dir, sizeof(sasl_plugin_dir));
+  if ((ret_executable_path == 0) || (ret_executable_path == sizeof(sasl_plugin_dir)))
+  {
+    log_error("sasl client initilize: failed to find executable path or buffer size for path is too small.");
+    goto EXIT;
+  }
+  char *pos= strrchr(sasl_plugin_dir, '\\');
+  if (pos != NULL)
+  {
+    *pos = '\0';
+  }
+  /**
+    Sasl SCRAM dll default search path is C:\CMU2,
+    This is the reason we have copied in the executable folder and setting the same
+    from the code.
+  */
+  sasl_set_path(SASL_PATH_TYPE_PLUGIN, sasl_plugin_dir);
+  log_stream << "Sasl_client::initilize sasl scrum plug-in path : "
+             << sasl_plugin_dir;
+  log_dbg(log_stream.str());
+  log_stream.clear();
+#endif
   strncpy(m_service_name, SASL_SERVICE_NAME, sizeof(m_service_name)-1);
   m_service_name[sizeof(m_service_name)-1]= '\0';
   /** Initialize client-side of SASL. */
@@ -193,7 +250,7 @@ EXIT:
 int Sasl_client::sasl_start(char **client_output, int* client_output_length)
 {
   int rc_sasl= SASL_FAIL;
-  const char *mechanisum= NULL;
+  const char *mechanism= NULL;
   char* sasl_client_output= NULL;
   sasl_interact_t *interactions= NULL;
   std::stringstream log_stream;
@@ -208,16 +265,25 @@ int Sasl_client::sasl_start(char **client_output, int* client_output_length)
      rc_sasl= sasl_client_start(m_connection, m_mechanism, &interactions,
                                 (const char**)&sasl_client_output,
                                 (unsigned int *)client_output_length,
-                                &mechanisum);
+                                &mechanism);
      if(rc_sasl == SASL_INTERACT) interact(interactions);
   }
   while(rc_sasl == SASL_INTERACT);
+  if (rc_sasl == SASL_NOMECH)
+  {
+    log_stream << "SASL method '" << m_mechanism << "' sent by server, "
+               << "is not supported by the SASL client. Make sure that "
+               << "cyrus SASL library is installed.";
+    log_error(log_stream.str());
+    goto EXIT;
+  }
   if (client_output != NULL)
   {
     *client_output= sasl_client_output;
     log_stream << "Sasl_client::SaslStart sasl output: " << sasl_client_output;
     log_dbg(log_stream.str());
   }
+EXIT:
   return rc_sasl;
 }
 
@@ -278,7 +344,7 @@ static int sasl_authenticate(MYSQL_PLUGIN_VIO *vio, MYSQL *mysql)
   server_packet_len= sasl_client.read_method_name_from_server();
   if (server_packet_len < 0)
   {
-    log_error("sasl_authenticate: method name read from server side plug-in failed");
+    // Callee has already logged the messages.
     goto EXIT;
   }
 
@@ -312,7 +378,6 @@ static int sasl_authenticate(MYSQL_PLUGIN_VIO *vio, MYSQL *mysql)
       goto EXIT;
     }
 
-    server_packet_len= strlen((const char*)server_packet);
     rc_sasl= sasl_client.sasl_step((char*)server_packet,
                                    server_packet_len, &sasl_client_output,
                                    &sasl_client_output_len);

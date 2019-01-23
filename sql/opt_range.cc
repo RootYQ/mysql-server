@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1604,7 +1604,7 @@ QUICK_INDEX_MERGE_SELECT::QUICK_INDEX_MERGE_SELECT(THD *thd_param,
   DBUG_ENTER("QUICK_INDEX_MERGE_SELECT::QUICK_INDEX_MERGE_SELECT");
   index= MAX_KEY;
   head= table;
-  memset(&read_record, 0, sizeof(read_record));
+
   init_sql_alloc(key_memory_quick_index_merge_root,
                  &alloc, thd->variables.range_alloc_block_size, 0);
   DBUG_VOID_RETURN;
@@ -1985,7 +1985,18 @@ int QUICK_ROR_UNION_SELECT::reset()
     List_iterator_fast<QUICK_SELECT_I> it(quick_selects);
     while ((quick= it++))
     {
-      if (quick->init_ror_merged_scan(FALSE))
+      /*
+        Use mem_root of this "QUICK" as using the statement mem_root
+        might result in too many allocations when combined with
+        dynamic range access where range optimizer is invoked many times
+        for a single statement.
+      */
+      THD *thd= quick->head->in_use;
+      MEM_ROOT *saved_root= thd->mem_root;
+      thd->mem_root= &alloc;
+      error= quick->init_ror_merged_scan(false);
+      thd->mem_root= saved_root;
+      if (error)
         DBUG_RETURN(1);
     }
     scans_inited= TRUE;
@@ -2725,6 +2736,8 @@ static int fill_used_fields_bitmap(PARAM *param)
                         to provide. Three-value logic: asc/desc/don't care
       needed_reg        this info is used in make_join_select() even if there is no quick!
       quick[out]        Calculated QUICK, or NULL
+      ignore_table_scan Disregard table scan while looking for range.
+
   NOTES
     Updates the following:
       needed_reg - Bits for keys with may be used if all prev regs are read
@@ -2785,9 +2798,8 @@ int test_quick_select(THD *thd, key_map keys_to_use,
                       ha_rows limit, bool force_quick_range,
                       const ORDER::enum_order interesting_order,
                       const QEP_shared_owner *tab,
-                      Item *cond,
-                      key_map *needed_reg,
-                      QUICK_SELECT_I **quick)
+                      Item *cond, key_map *needed_reg, QUICK_SELECT_I **quick,
+                      bool ignore_table_scan)
 {
   DBUG_ENTER("test_quick_select");
 
@@ -2823,7 +2835,7 @@ int test_quick_select(THD *thd, key_map keys_to_use,
   Cost_estimate cost_est= head->file->table_scan_cost();
   cost_est.add_io(1.1);
   cost_est.add_cpu(scan_time);
-  if (head->force_index)
+  if (ignore_table_scan)
   {
     scan_time= DBL_MAX;
     cost_est.set_max_cost();
@@ -6022,21 +6034,21 @@ QUICK_SELECT_I *TRP_ROR_UNION::make_quick(PARAM *param,
 
 
 /**
-   If EXPLAIN, add a warning that the index cannot be
-   used for range access due to either type conversion or different
-   collations on the field used for comparison
+   If EXPLAIN or if the --safe-updates option is enabled, add a warning that
+   the index cannot be used for range access due to either type conversion or
+   different collations on the field used for comparison
 
    @param param              PARAM from test_quick_select
    @param key_num            Key number
    @param field              Field in the predicate
- */
-static void 
-if_explain_warn_index_not_applicable(const RANGE_OPT_PARAM *param,
-                                              const uint key_num,
-                                              const Field *field)
+*/
+static void warn_index_not_applicable(const RANGE_OPT_PARAM *param,
+                                      const uint key_num, const Field *field)
 {
+  THD *thd= param->thd;
   if (param->using_real_indexes &&
-      param->thd->lex->describe)
+      (param->thd->lex->describe ||
+       thd->variables.option_bits & OPTION_SAFE_UPDATES))
     push_warning_printf(
             param->thd,
             Sql_condition::SL_WARNING,
@@ -7069,7 +7081,7 @@ get_mm_parts(RANGE_OPT_PARAM *param, Item_func *cond_func, Field *field,
                                  key_part->image_type,
                                  type, value))
         {
-          if_explain_warn_index_not_applicable(param, key_part->key, field);
+          warn_index_not_applicable(param, key_part->key, field);
           DBUG_RETURN(NULL);
         }
 
@@ -7380,7 +7392,7 @@ get_mm_leaf(RANGE_OPT_PARAM *param, Item *conf_func, Field *field,
   if (!comparable_in_index(conf_func, field, key_part->image_type,
                            type, value))
   {
-    if_explain_warn_index_not_applicable(param, key_part->key, field);
+    warn_index_not_applicable(param, key_part->key, field);
     goto end;
   }
 
@@ -10554,8 +10566,7 @@ QUICK_RANGE_SELECT *get_quick_select_for_ref(THD *thd, TABLE *table,
     goto err;
   quick->records= records;
 
-  if ((cp_buffer_from_ref(thd, table, ref) && thd->is_fatal_error) ||
-      !(range= new (alloc) QUICK_RANGE()))
+  if (!(range= new (alloc) QUICK_RANGE()))
     goto err;                                   // out of memory
 
   range->min_key= range->max_key= ref->key_buff;
@@ -12902,7 +12913,7 @@ min_max_inspect_cond_for_fields(Item *cond, Item_field *min_max_arg_item,
           DBUG_RETURN(true);
       }
 
-      if (((Item_cond*) cond)->functype() == Item_func::MULT_EQUAL_FUNC)
+      if (pred->functype() == Item_func::MULT_EQUAL_FUNC)
       {
         /*
           Analyze participating fields in a multiequal condition.
